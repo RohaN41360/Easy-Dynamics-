@@ -574,3 +574,399 @@ document.addEventListener('DOMContentLoaded', () => {
         closeAlertModal('errorModal');
     });
 });
+
+// Field Update Modal Functionality
+document.getElementById('update').addEventListener('click', async () => {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+        const url = tabs[0].url;
+        if (!isDynamicsPage(url)) {
+            showErrorModal("This is not an MS Dynamics page.");
+            return;
+        }
+
+        const entityName = getEntityName(url);
+        const entityId = getEntityId(url);
+        const webapi = extractMainUrl(url);
+
+        if (entityName == null || entityId == null || webapi == null) {
+            showErrorModal("Please open in Entity Record Context");
+            return;
+        }
+
+        try {
+            // Fetch entity metadata to get fields
+            const response = await fetch(`${webapi}/api/data/v9.2/EntityDefinitions(LogicalName='${entityName}')/Attributes`, {
+                headers: {
+                    "OData-MaxVersion": "4.0",
+                    "OData-Version": "4.0",
+                    "Accept": "application/json"
+                }
+            });
+
+            if (!response.ok) {
+                throw new Error('Failed to fetch entity metadata');
+            }
+
+            const data = await response.json();
+            const fieldSelect = document.getElementById('fieldSelect');
+            fieldSelect.innerHTML = '<option value="">Select a field...</option>';
+            const inputContainer = document.getElementById('dynamicInputContainer');
+            inputContainer.innerHTML = '';
+            // Populate field dropdown
+            data.value.forEach(attribute => {
+                const option = document.createElement('option');
+                option.value = attribute.LogicalName;
+                option.textContent = attribute.DisplayName?.UserLocalizedLabel?.Label || attribute.LogicalName;
+                option.dataset.type = attribute.AttributeType;
+                option.dataset.targetEntity = attribute.TargetEntityType;
+                fieldSelect.appendChild(option);
+            });
+
+            // Show the modal
+            document.getElementById('overlay').style.display = 'block';
+            document.getElementById('fieldUpdateDialog').style.display = 'block';
+
+            // Add event listener for the submit button
+            const submitButton = document.getElementById('submitFieldUpdate');
+            if (submitButton) {
+                // Remove any existing event listeners
+                submitButton.replaceWith(submitButton.cloneNode(true));
+                const newSubmitButton = document.getElementById('submitFieldUpdate');
+                
+                newSubmitButton.addEventListener('click', async function() {
+                    const submitButton = this;
+                    const originalButtonText = submitButton.textContent;
+                    
+                    try {
+                        const selectedField = fieldSelect.value;
+                        const fieldType = fieldSelect.options[fieldSelect.selectedIndex].dataset.type;
+                        const targetEntity = fieldSelect.options[fieldSelect.selectedIndex].dataset.targetEntity;
+                        const inputContainer = document.getElementById('dynamicInputContainer');
+                        let fieldValue;
+
+                        if (!selectedField) {
+                            showErrorModal("Please select a field");
+                            return;
+                        }
+
+                        // Change button text to "Updating..."
+                        submitButton.textContent = "Updating...";
+                        submitButton.disabled = true;
+
+                        console.log('Updating field:', {
+                            entityName,
+                            entityId,
+                            selectedField,
+                            fieldType,
+                            targetEntity
+                        });
+
+                        const baseEntityPluralname = await getEntityPluralName(entityName, webapi);
+                        if (!baseEntityPluralname) {
+                            showErrorModal("Could not determine entity plural name");
+                            return;
+                        }
+
+                        // Get the field value based on field type
+                        if (fieldType === 'Lookup') {
+                            const select = inputContainer.querySelector('select');
+                            fieldValue = select.value;
+                            if (!fieldValue) {
+                                showErrorModal("Please select a value");
+                                return;
+                            }
+                        } else if (fieldType === 'Picklist') {
+                            const select = inputContainer.querySelector('select');
+                            fieldValue = parseInt(select.value);
+                            if (isNaN(fieldValue)) {
+                                showErrorModal("Please select a value");
+                                return;
+                            }
+                        } else if (fieldType === 'Boolean') {
+                            const select = inputContainer.querySelector('select');
+                            if (!select) {
+                                showErrorModal("Please select a value");
+                                return;
+                            }
+                            fieldValue = select.value === 'true';  // Convert string 'true'/'false' to boolean
+                            if (typeof fieldValue !== 'boolean') {
+                                showErrorModal("Please select a value");
+                                return;
+                            }
+                        } else {
+                            const input = inputContainer.querySelector('input');
+                            fieldValue = input.value.trim();
+                            if (!fieldValue) {
+                                showErrorModal("Please enter a value");
+                                return;
+                            }
+                        }
+
+                        // Prepare the update payload
+                        const updatePayload = {};
+                        if (fieldType === 'Lookup') {
+                            if (!targetEntity) {
+                                showErrorModal("Target entity information is missing");
+                                return;
+                            }
+                            const targetEntityPluralName = await getEntityPluralName(entityName, webapi);
+                            if (!targetEntityPluralName) {
+                                showErrorModal("Could not determine target entity plural name");
+                                return;
+                            }
+                            updatePayload[`${selectedField}@odata.bind`] = `/${targetEntityPluralName}(${fieldValue})`;
+                        } else {
+                            updatePayload[selectedField] = fieldValue;
+                        }
+
+                        console.log('Update payload:', updatePayload);
+
+                        // Make the update request
+                        const response = await fetch(`${webapi}/api/data/v9.2/${baseEntityPluralname}(${entityId})`, {
+                            method: "PATCH",
+                            headers: {
+                                "OData-MaxVersion": "4.0",
+                                "OData-Version": "4.0",
+                                "Content-Type": "application/json; charset=utf-8",
+                                "Accept": "application/json",
+                                "Prefer": "odata.include-annotations=*"
+                            },
+                            body: JSON.stringify(updatePayload)
+                        });
+
+                        if (!response.ok) {
+                            const errorData = await response.json();
+                            console.error('Update error:', errorData);
+                            throw new Error(errorData.error?.message || 'Failed to update field');
+                        }
+
+                        showSuccessModal("Field updated successfully");
+                        document.getElementById('overlay').style.display = 'none';
+                        document.getElementById('fieldUpdateDialog').style.display = 'none';
+                        chrome.tabs.reload(tabs[0].id);
+                    } catch (error) {
+                        console.error('Error updating field:', error);
+                        showErrorModal("Error updating field: " + error.message);
+                    } finally {
+                        // Reset button text and state
+                        submitButton.textContent = originalButtonText;
+                        submitButton.disabled = false;
+                    }
+                });
+            } else {
+                console.error('Submit button not found. Make sure you have a button with id="submitFieldUpdate" in your HTML');
+            }
+        } catch (error) {
+            showErrorModal("Error loading fields: " + error.message);
+        }
+    });
+});
+
+// Close field update dialog
+document.getElementById('closeFieldUpdateDialog').addEventListener('click', () => {
+    document.getElementById('overlay').style.display = 'none';
+    document.getElementById('fieldUpdateDialog').style.display = 'none';
+});
+
+// Handle field selection change
+document.getElementById('fieldSelect').addEventListener('change', async function() {
+    const selectedOption = this.options[this.selectedIndex];
+    const fieldType = selectedOption.dataset.type;
+    const targetEntity = selectedOption.dataset.targetEntity;
+    const container = document.getElementById('dynamicInputContainer');
+    
+    // Clear any existing content
+    container.innerHTML = '';
+
+    // If no field is selected, return early
+    if (!this.value) {
+        return;
+    }
+
+    // Show loading state
+    container.innerHTML = '<div class="loading">Loading field options...</div>';
+
+    try {
+        // Get the current tab's URL
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        const url = tabs[0].url;
+        const webapi = extractMainUrl(url);
+        const entityName = getEntityName(url);
+
+        if (!webapi || !entityName) {
+            throw new Error("Could not determine entity information");
+        }
+
+        // Clear loading state
+        container.innerHTML = '';
+
+        if (fieldType === 'Picklist') {
+            // Fetch option set values
+            const response = await fetch(`${webapi}/api/data/v9.2/EntityDefinitions(LogicalName='${entityName}')/Attributes(LogicalName='${this.value}')/Microsoft.Dynamics.CRM.PicklistAttributeMetadata?$expand=OptionSet`, {
+                headers: {
+                    "OData-MaxVersion": "4.0",
+                    "OData-Version": "4.0",
+                    "Accept": "application/json"
+                }
+            });
+
+            if (!response.ok) throw new Error('Failed to fetch option set values');
+
+            const data = await response.json();
+            const select = document.createElement('select');
+            select.className = 'field-select';
+            
+            if (data.OptionSet && data.OptionSet.Options) {
+                data.OptionSet.Options.forEach(option => {
+                    const optionElement = document.createElement('option');
+                    optionElement.value = option.Value;
+                    optionElement.textContent = option.Label.UserLocalizedLabel.Label;
+                    select.appendChild(optionElement);
+                });
+            } else {
+                throw new Error('No options found in the option set');
+            }
+
+            container.appendChild(select);
+        } else if (fieldType === 'Boolean') {
+            // Handle Yes/No fields
+            const select = document.createElement('select');
+            select.className = 'field-select';
+            
+            const yesOption = document.createElement('option');
+            yesOption.value = 'true';
+            yesOption.textContent = 'Yes';
+            
+            const noOption = document.createElement('option');
+            noOption.value = 'false';
+            noOption.textContent = 'No';
+            
+            select.appendChild(yesOption);
+            select.appendChild(noOption);
+            
+            container.appendChild(select);
+        } else if (fieldType === 'Lookup') {
+            try {
+                console.log('Fetching lookup field metadata for:', this.value);
+                // First get the lookup field metadata to get the correct target entity
+                const lookupFieldResponse = await fetch(`${webapi}/api/data/v9.2/EntityDefinitions(LogicalName='${entityName}')/Attributes(LogicalName='${this.value}')/Microsoft.Dynamics.CRM.LookupAttributeMetadata`, {
+                    headers: {
+                        "OData-MaxVersion": "4.0",
+                        "OData-Version": "4.0",
+                        "Accept": "application/json",
+                        "Prefer": "odata.include-annotations=*"
+                    }
+                });
+
+                if (!lookupFieldResponse.ok) {
+                    const errorData = await lookupFieldResponse.json();
+                    console.error('Lookup field metadata error:', errorData);
+                    throw new Error(`Failed to fetch lookup field metadata: ${errorData.error?.message || lookupFieldResponse.statusText}`);
+                }
+
+                const lookupFieldData = await lookupFieldResponse.json();
+                console.log('Lookup Field Metadata:', lookupFieldData);
+
+                // Get the target entity from the lookup field metadata
+                if (!lookupFieldData.Targets || lookupFieldData.Targets.length === 0) {
+                    throw new Error('No target entities found in lookup field metadata');
+                }
+
+                const targetEntityName = lookupFieldData.Targets[0];
+                console.log('Target Entity Name:', targetEntityName);
+
+                // Get the entity metadata to get the primary field
+                const entityMetadataResponse = await fetch(`${webapi}/api/data/v9.2/EntityDefinitions(LogicalName='${targetEntityName}')?$select=PrimaryNameAttribute`, {
+                    headers: {
+                        "OData-MaxVersion": "4.0",
+                        "OData-Version": "4.0",
+                        "Accept": "application/json",
+                        "Prefer": "odata.include-annotations=*"
+                    }
+                });
+
+                if (!entityMetadataResponse.ok) {
+                    const errorData = await entityMetadataResponse.json();
+                    console.error('Entity metadata error:', errorData);
+                    throw new Error(`Failed to fetch entity metadata: ${errorData.error?.message || entityMetadataResponse.statusText}`);
+                }
+
+                const entityMetadata = await entityMetadataResponse.json();
+                console.log('Entity Metadata:', entityMetadata);
+
+                // Get the primary name attribute
+                const primaryNameAttribute = entityMetadata.PrimaryNameAttribute;
+                if (!primaryNameAttribute) {
+                    throw new Error('Could not determine primary name attribute from metadata');
+                }
+
+                // Get the plural name using the existing function
+                const targetEntityPluralName = await getEntityPluralName(targetEntityName, webapi);
+                if (!targetEntityPluralName) {
+                    throw new Error('Could not determine entity plural name');
+                }
+
+                console.log('Target Entity Plural Name:', targetEntityPluralName);
+                console.log('Primary Name Attribute:', primaryNameAttribute);
+
+                // Fetch related entity records using the primary name attribute
+                const response = await fetch(`${webapi}/api/data/v9.2/${targetEntityPluralName}?$select=${targetEntityName}id,${primaryNameAttribute}`, {
+                    headers: {
+                        "OData-MaxVersion": "4.0",
+                        "OData-Version": "4.0",
+                        "Accept": "application/json",
+                        "Prefer": "odata.include-annotations=*"
+                    }
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    console.error('Related records error:', errorData);
+                    throw new Error(`Failed to fetch related records: ${errorData.error?.message || response.statusText}`);
+                }
+
+                const data = await response.json();
+                console.log('Related Records:', data);
+
+                const select = document.createElement('select');
+                select.className = 'field-select';
+                
+                if (data.value && data.value.length > 0) {
+                    data.value.forEach(record => {
+                        const option = document.createElement('option');
+                        option.value = record[`${targetEntityName}id`];
+                        option.textContent = record[primaryNameAttribute];
+                        select.appendChild(option);
+                    });
+                } else {
+                    throw new Error('No records found in the related entity');
+                }
+
+                container.appendChild(select);
+            } catch (error) {
+                console.error('Error in lookup field handling:', error);
+                showErrorModal("Error loading lookup options: " + error.message);
+            }
+        } else {
+            // For other field types, show a text input
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.className = 'field-input';
+            input.placeholder = 'Enter value...';
+            container.appendChild(input);
+        }
+    } catch (error) {
+        showErrorModal("Error loading field options: " + error.message);
+    }
+});
+
+// Add this CSS to your popup.html file in the style section
+const style = document.createElement('style');
+style.textContent = `
+    .loading {
+        padding: 10px;
+        color: var(--text-secondary);
+        text-align: center;
+    }
+`;
+document.head.appendChild(style);
